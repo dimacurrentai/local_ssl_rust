@@ -168,37 +168,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
       http_addr_v4, e, args.port_http
     )
   })?;
-  tracing::info!("HTTP (redirect) listening on {}", http_listener_v4.local_addr().unwrap());
+  tracing::info!("HTTP  (redirect) listening on {}", http_listener_v4.local_addr().unwrap());
+
+  let fqdn_v4 = fqdn.clone();
+  tokio::spawn(async move {
+    redirect_http_to_https_with_listener(http_listener_v4, fqdn_v4, port_https).await;
+  });
 
   let http_addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], args.port_http));
-  let http_listener_v6 = tokio::net::TcpListener::bind(http_addr_v6)
-    .await
-    .map_err(|e| format!("bind HTTP on {}: {} (try: sudo lsof -i :{})", http_addr_v6, e, args.port_http))?;
-  tracing::info!("HTTP (redirect) listening on {}", http_listener_v6.local_addr().unwrap());
-
-  let fqdn_http = fqdn.clone();
-  tokio::spawn(async move {
-    redirect_http_to_https_with_listener(http_listener_v4, fqdn, port_https).await;
-  });
-  tokio::spawn(async move {
-    redirect_http_to_https_with_listener(http_listener_v6, fqdn_http, port_https).await;
-  });
+  match tokio::net::TcpListener::bind(http_addr_v6).await {
+    Ok(http_listener_v6) => {
+      tracing::info!("HTTP  (redirect) listening on {}", http_listener_v6.local_addr().unwrap());
+      let fqdn_v6 = fqdn.clone();
+      tokio::spawn(async move {
+        redirect_http_to_https_with_listener(http_listener_v6, fqdn_v6, port_https).await;
+      });
+    }
+    Err(e) => {
+      if cfg!(target_os = "macos") {
+        return Err(format!("bind HTTP on {} (IPv6): {}", http_addr_v6, e).into());
+      } else {
+        tracing::warn!("failed to bind HTTP on {} (IPv6): {}, continuing without it", http_addr_v6, e);
+      }
+    }
+  }
 
   let app = Router::new()
     .route("/", get(index_handler))
     .merge(webauthn::router(state));
+
+  // HTTPS listeners: bind IPv4 and IPv6
   let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port_https));
   let addr_v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port_https));
   tracing::info!("HTTPS listening on {}", addr_v4);
-  tracing::info!("HTTPS listening on {}", addr_v6);
 
   let tls_config_v6 = tls_config.clone();
   let app_v6 = app.clone();
   tokio::spawn(async move {
-    axum_server::bind_rustls(addr_v6, tls_config_v6)
+    match axum_server::bind_rustls(addr_v6, tls_config_v6)
       .serve(app_v6.into_make_service())
       .await
-      .expect("HTTPS IPv6 server");
+    {
+      Ok(()) => {}
+      Err(e) => {
+        if cfg!(target_os = "macos") {
+          panic!("HTTPS IPv6 on {}: {}", addr_v6, e);
+        } else {
+          tracing::warn!("failed to bind HTTPS on {} (IPv6): {}, continuing without it", addr_v6, e);
+        }
+      }
+    }
   });
 
   axum_server::bind_rustls(addr_v4, tls_config).serve(app.into_make_service()).await.map_err(|e| e.into())
