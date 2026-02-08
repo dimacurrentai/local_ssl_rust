@@ -1,0 +1,247 @@
+//! Passkey (WebAuthn) auth: registration and assertion endpoints, state.
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use base64::Engine;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use webauthn_rs::prelude::*;
+
+fn to_b64url(data: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+#[derive(Serialize)]
+struct AuthedCredential {
+    cred_id: String,
+    algorithm: String,
+    key: AuthedKey,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+#[allow(non_camel_case_types)]
+enum AuthedKey {
+    EC_EC2 { curve: String, x: String, y: String },
+    EC_OKP { curve: String, x: String },
+    RSA { n: String, e: String },
+}
+
+fn build_authed_credential(passkey: &Passkey) -> AuthedCredential {
+    let pubkey = passkey.get_public_key();
+    let key = match &pubkey.key {
+        COSEKeyType::EC_EC2(ec) => AuthedKey::EC_EC2 {
+            curve: format!("{:?}", ec.curve),
+            x: to_b64url(ec.x.as_ref()),
+            y: to_b64url(ec.y.as_ref()),
+        },
+        COSEKeyType::EC_OKP(okp) => AuthedKey::EC_OKP {
+            curve: format!("{:?}", okp.curve),
+            x: to_b64url(okp.x.as_ref()),
+        },
+        COSEKeyType::RSA(rsa) => AuthedKey::RSA {
+            n: to_b64url(rsa.n.as_ref()),
+            e: to_b64url(&rsa.e),
+        },
+    };
+    AuthedCredential {
+        cred_id: to_b64url(passkey.cred_id().as_ref()),
+        algorithm: format!("{:?}", pubkey.type_),
+        key,
+    }
+}
+
+const CREDS_FILE: &str = "registered.jsonl";
+
+pub struct AppState {
+    pub webauthn: Webauthn,
+    pub credentials: Arc<RwLock<Vec<Passkey>>>,
+    pub pending_reg: Arc<RwLock<HashMap<String, PasskeyRegistration>>>,
+    pub pending_auth: Arc<RwLock<HashMap<String, PasskeyAuthentication>>>,
+}
+
+pub fn load_credentials() -> Vec<Passkey> {
+    let data = match std::fs::read_to_string(CREDS_FILE) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut creds = Vec::new();
+    for (i, line) in data.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Passkey>(line) {
+            Ok(p) => creds.push(p),
+            Err(e) => eprintln!("warning: {} line {}: {}", CREDS_FILE, i + 1, e),
+        }
+    }
+    println!("loaded {} passkey(s) from {}", creds.len(), CREDS_FILE);
+    creds
+}
+
+fn append_credential(passkey: &Passkey) {
+    match serde_json::to_string(passkey) {
+        Ok(json) => {
+            use std::io::Write;
+            match std::fs::OpenOptions::new().create(true).append(true).open(CREDS_FILE) {
+                Ok(mut f) => {
+                    if let Err(e) = writeln!(f, "{}", json) {
+                        eprintln!("warning: failed to write to {}: {}", CREDS_FILE, e);
+                    }
+                }
+                Err(e) => eprintln!("warning: failed to open {}: {}", CREDS_FILE, e),
+            }
+        }
+        Err(e) => eprintln!("warning: failed to serialize credential: {}", e),
+    }
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/webauthn/status", get(status))
+        .route("/webauthn/register/options", post(register_options))
+        .route("/webauthn/register", post(register_verify))
+        .route("/webauthn/auth/options", post(auth_options))
+        .route("/webauthn/auth", post(auth_verify))
+        .with_state(state)
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let has_key = !state.credentials.read().await.is_empty();
+    Json(serde_json::json!({"registered": has_key}))
+}
+
+async fn register_options(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (ccr, reg_state) = match state.webauthn.start_passkey_registration(
+        Uuid::new_v4(),
+        "user",
+        "User",
+        None,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(%e, "start_passkey_registration failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::Value::Null)).into_response();
+        }
+    };
+    let challenge = match serde_json::to_value(&ccr)
+        .ok()
+        .and_then(|v: serde_json::Value| v.get("publicKey").and_then(|pk| pk.get("challenge")).and_then(|c| c.as_str().map(String::from)))
+    {
+        Some(s) => s,
+        None => {
+            tracing::warn!("could not extract challenge from CreationChallengeResponse");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::Value::Null)).into_response();
+        }
+    };
+    state.pending_reg.write().await.insert(challenge, reg_state);
+    (StatusCode::OK, Json(ccr)).into_response()
+}
+
+async fn register_verify(
+    State(state): State<Arc<AppState>>,
+    Json(cred): Json<RegisterPublicKeyCredential>,
+) -> impl IntoResponse {
+    let challenge = match client_data_challenge(&cred.response.client_data_json) {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false}))).into_response(),
+    };
+    let reg_state = match state.pending_reg.write().await.remove(&challenge) {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false}))).into_response(),
+    };
+    let passkey = match state.webauthn.finish_passkey_registration(&cred, &reg_state) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%e, "finish_passkey_registration failed");
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false}))).into_response();
+        }
+    };
+    append_credential(&passkey);
+    state.credentials.write().await.push(passkey);
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+async fn auth_options(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let creds = state.credentials.read().await;
+    if creds.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "no_credentials"})),
+        )
+            .into_response();
+    }
+    let (rcr, auth_state) = match state.webauthn.start_passkey_authentication(creds.as_slice()) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(%e, "start_passkey_authentication failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::Value::Null)).into_response();
+        }
+    };
+    let challenge = match serde_json::to_value(&rcr)
+        .ok()
+        .and_then(|v: serde_json::Value| v.get("publicKey").and_then(|pk| pk.get("challenge")).and_then(|c| c.as_str().map(String::from)))
+    {
+        Some(s) => s,
+        None => {
+            tracing::warn!("could not extract challenge from RequestChallengeResponse");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::Value::Null)).into_response();
+        }
+    };
+    state.pending_auth.write().await.insert(challenge, auth_state);
+    (StatusCode::OK, Json(rcr)).into_response()
+}
+
+async fn auth_verify(
+    State(state): State<Arc<AppState>>,
+    Json(cred): Json<PublicKeyCredential>,
+) -> impl IntoResponse {
+    let challenge = match client_data_challenge(&cred.response.client_data_json) {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false}))).into_response(),
+    };
+    let auth_state = match state.pending_auth.write().await.remove(&challenge) {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false}))).into_response(),
+    };
+    match state.webauthn.finish_passkey_authentication(&cred, &auth_state) {
+        Ok(result) => {
+            let auth_cred_id = result.cred_id();
+            let creds = state.credentials.read().await;
+            match creds.iter().find(|p| p.cred_id() == auth_cred_id) {
+                Some(passkey) => {
+                    let ac = build_authed_credential(passkey);
+                    let cred_id = ac.cred_id.clone();
+                    match serde_json::to_string(&ac) {
+                        Ok(json) => println!("{}", json),
+                        Err(e) => println!("passkey auth OK (serialize error: {})", e),
+                    }
+                    return (StatusCode::OK, Json(serde_json::json!({"ok": true, "cred_id": cred_id}))).into_response();
+                }
+                None => {
+                    println!("passkey auth OK but credential not found in store (cred_id: {})", to_b64url(auth_cred_id.as_ref()));
+                }
+            }
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(%e, "finish_passkey_authentication failed");
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"ok": false}))).into_response()
+        }
+    }
+}
+
+fn client_data_challenge(client_data_json: &Base64UrlSafeData) -> Option<String> {
+    let bytes: &[u8] = client_data_json.as_ref();
+    let s = std::str::from_utf8(bytes).ok()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("challenge").and_then(|c| c.as_str()).map(String::from)
+}
